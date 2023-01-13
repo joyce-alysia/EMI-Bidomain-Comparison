@@ -6,5 +6,5 @@ EMI models in refractory cardiac tissue".
 
 Dependencies include FreeFEM, PETSc, MUMPS, Apptainer ...
 
-https://sandbox.zenodo.org/badge/588656716.svg
+[![DOI](https://sandbox.zenodo.org/badge/588656716.svg)](https://sandbox.zenodo.org/badge/latestdoi/588656716)
 
