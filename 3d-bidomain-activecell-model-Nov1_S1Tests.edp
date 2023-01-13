@@ -1,0 +1,746 @@
+/* FreeFem++ code for solving the Bidomain model in parallel or in serie.
+   Author: Sebastian Dominguez, USask (2021).
+
+   We approximate the solutions of the 3D Bidomain model with an active model by using a Godunov OS to split the cell model and the tissue model. We use a Rush-Larsen method to solve the dynamics of the cell model while we use a Backward Euler method to update the solution of the tissue model. A Pk-Pk FEM scheme is used to discretize the linear PDE in space.
+
+   The code is divided into sections. 
+   In Section 1 we load and include all necessary libraries needed for the computation we are to perform.
+   In Section 2 we define all problem parameters needed for the computation. 
+   In Section 3 we create macros to be used later on in the code. This section is optional.
+   In Section 4 we create the mesh.
+   In Section 5 we set up the problem we want to solve.
+   In Section 6 we set up the output file format and data we want to dump to file or terminal during the computation.
+   In Section 7, the last section of the code, we solve the problem in hand and write data to file or terminal.
+
+   To run this code, run the following command line from terminal:
+   mpirun -np N FreeFem++-mpi FreeFem-Template-Code.edp -v 0
+
+   Here N is the number of cpus you want to use for your computations. As a rule of thumb, it is a good idea to have about 20,000 DOFS per cpus during your computation. This can be used to estimate the number of ranks N needed to run this code depending on the size of the mesh and the linear system to be solved later on. 
+
+   The option -v 0 cancels any terminal output from the libraries or included ".idp" files and only shows the terminal output you have added to your code with 
+   cout << "Terminal output message example" << endl;
+
+   By default, FreeFem++-mpi does not have a graphical output. Add the option "-wg" to the command line above to get graphical outputs.
+   
+   To run the code in serial, set N = 1.
+
+   This code requires FreeFem++-mpi to run in parallel. Check
+   https://doc.freefem.org/introduction/installation.html
+   to learn how to install it if it is not already installed on your system.
+*/
+
+////////////
+// Section 1
+/////////////// START LIBRARIES ///////////////
+// load and/or include necessary libraries
+
+// load needed libraries here
+load "msh3"
+
+// load compiled cell model
+load "ff-cellmodel"
+
+// load parallel solvers
+load "PETSc" // petsc already includes iovtk (for parallel computations)
+
+// include needed files here
+include "getARGV.idp"
+macro dimension()3// EOM
+include "macro_ddm.idp"
+//////////////// END LIBRARIES ////////////////
+
+////////////
+// Section 2
+/////////////// START PARAMETERS ///////////////
+// define input parameters
+// WARNING: for physical applications, the units of the input the parameters DO matter. Make sure the units of all input parameters are consistent. This also applies to other sections of the code, especially in sections 4 and 5.
+
+// How stimulus will be applied
+// string UseModelOn = getARGV("-UseModel","none");
+// if (mpirank == 0)
+//   cout << "Using " << UseModelOn << endl;
+bool CellModelOn = getARGV("-CellModel",0);
+bool DirichletBCOn = getARGV("-DirichletBC",0);
+bool NeumannBCOn = getARGV("-NeumannBC",0);
+bool SourceTermOn = getARGV("-SourceTerm",0);
+
+if (mpirank == 0)
+{
+  if (CellModelOn)
+    cout << "Using cell model" << endl;
+  else if (DirichletBCOn)
+    cout << "Using Dirichlet BC" << endl;
+  else if (NeumannBCOn)
+    cout << "Using Neumann BC" << endl;
+  else if (SourceTermOn)
+    cout << "Using source term" << endl;
+  else
+    cout << "Steady solution..." << endl;
+}
+
+// cell and domain dimensions (for a ncellsx by ncellsy cell-arrangement)
+// domain is defined as [0,length]x[0,width]
+real GapLength = getARGV("-gaplength",0.005), GapDiameter = getARGV("-gapdiameter",0.010); // in mm
+real CellLength = getARGV("-celllength",0.155), CellDiameter = getARGV("-celldiameter",0.020); // in mm
+real ncellsx = getARGV("-ncellsx",25), ncellsy = getARGV("-ncellsy",25), ncellsz = getARGV("-ncellsz",1);
+real length = (CellLength+GapLength)*ncellsx, width = (CellDiameter+GapLength)*ncellsy, height= (CellDiameter+GapLength)*ncellsz, meshsize = getARGV("-meshsize",2.5e-2); // in mm
+
+// Electrodes dimensions and location
+real E1length = getARGV("-e1length",1.0); // dimensions in x in mm
+real E1width = getARGV("-e1width",1.0); // dimensions in y in mm
+real E1xmin = getARGV("-e1xmin",0.0); // bottom left x corner
+real E1ymin = getARGV("-e1ymin",0.0); // bottom left y corner
+
+// Conductivity, Cm, and Rm from Cervi et al. 2018 (Chaste default)
+real sigmaix = getARGV("-sigmaix",2.0e-1); // 1 mS/cm = 1e-1*uA/mV/mm
+real sigmaiy = getARGV("-sigmaiy",2.0e-2); // 1 mS/cm = 1e-1*uA/mV/mm
+real sigmaiz = getARGV("-sigmaiz",2.0e-2); // 1 mS/cm = 1e-1*uA/mV/mm
+real sigmaex = getARGV("-sigmaex",8.0e-1); // 1 mS/cm = 1e-1*uA/mV/mm
+real sigmaey = getARGV("-sigmaey",2.0e-1); // 1 mS/cm = 1e-1*uA/mV/mm
+real sigmaez = getARGV("-sigmaez",2.0e-1); // 1 mS/cm = 1e-1*uA/mV/mm
+real Cm = getARGV("-capacitance",1.0e-2); // 1 uF/cm^2 = 1e-2*uF/mm^2
+real chi = getARGV("-chi",150.0); // chi = membrane perimeter/domain area; in mm^-1
+
+// Applied stimulus details
+// S1 stimulus
+real MinS1Magnitude = getARGV("-MinS1",0.0), MaxS1Magnitude = getARGV("-MaxS1",200.0);
+real S1Magnitude = MinS1Magnitude;  // in (uA/uF)
+real S1Start = getARGV("-S1Start",0.0); // Start time of current (in the period) in ms
+// 1ms application is standard duration (in many refs)
+real S1Duration = getARGV("-S1Duration",2.0); // Duration of applied current in ms
+real S1Period = getARGV("-S1Period",350.0); // Period of forcing in ms
+
+// S1-S2 interval
+real MinS1S2Interval = getARGV("-MinS1S2Interval",S1Start+160.0), MaxS1S2Interval = getARGV("-MaxS1S2Interval",300.0);
+real S1S2Interval = MinS1S2Interval; // Time interval between stimuli in ms
+
+// S2 stimulus
+real MinS2Magnitude = getARGV("-MinS2",S1Magnitude), MaxS2Magnitude = getARGV("-MaxS2",300.0);
+real S2Magnitude = MinS2Magnitude;  // in (uA/uF)
+real S2Start = getARGV("-S2Start",S1S2Interval); // Start time of current (in the period) in ms
+// 1ms application is standard duration (in many refs)
+real S2Duration = getARGV("-S2Duration",S1Duration); // Duration of applied current in ms
+real S2Period = getARGV("-S2Period",S1Period); // Period of forcing in ms
+
+
+int NCycles = getARGV("-ncycles",1);
+// Timestep size (ms), total time (ms), number of substeps in an ODE step
+real initialtime = getARGV("-ti",0.0), finaltime = getARGV("-tf",NCycles*S1Period), dt = getARGV("-timestepsize",1.0e-1);
+real currenttime = initialtime;
+real restarttime;
+int Substeps=getARGV("-timesubsteps",100), NodeSubsteps = Substeps;
+bool /* FEOn = getARGV("-ForwardEuler",0),  */RLOn = getARGV("-RushLarsen",0); // FE is default
+if (mpirank == 0)
+{
+  if (RLOn)
+    cout << "Using Rush-Larsen for cell model" << endl;
+  else
+    cout << "Using Forward Euler (default) for cell model" << endl;
+}
+
+// Number of steps between plots
+int step = 0, saveSteps = 1, plotSteps = getARGV("-PlotSteps",1000);
+
+real tol = 1e-14; // tol constant
+tgv = 1e30; // tgv = 1 for EMI, default is good for bidomain
+
+// restart and checkpointing
+bool RestartComputation = getARGV("-Restart",0);
+int checkpointingSteps = getARGV("-CheckPointSteps",10000);
+real[int] RestartData(3); // array to save data from checkpointing file
+
+// output directory and file names
+string outDirName = getARGV("-outputdir","./");
+
+string CheckPointDataFileName = ""+outDirName+"checkpointingDataFile.txt";
+string CheckPointedPotentialFileName = ""+outDirName+"checkpointedPotentialFile.txt";
+string CheckPointedminfFileName = ""+outDirName+"checkpointedminfFile.txt";
+string CheckPointedhinfFileName = ""+outDirName+"checkpointedhinfFile.txt";
+
+if (RestartComputation)
+{
+  // get values from file to restart computation
+  if (mpirank == 0)
+  {
+    ifstream DataFile(CheckPointDataFileName);
+    string line;
+    for(int iii=0; iii<3;iii++)
+    {
+      DataFile >> RestartData[iii];
+      getline(DataFile,line);
+    }
+  }
+
+  restarttime = RestartData[0];
+  S2Magnitude = RestartData[1];
+  S1S2Interval = RestartData[2];
+  
+  if (mpirank==0)
+  {
+    cout << "Restarting computations from last checkpoint with:" << endl;
+    cout << "\t Time = " << restarttime << " ms" << endl;
+    cout << "\t S2 = " << S2Magnitude << " mV or uA/mm^2 or uA/mm^3" << endl;
+    cout << "\t S1-S2 interval = " << S1S2Interval << " ms" << endl;
+  }    
+}
+
+//////////////// END PARAMETERS ////////////////
+
+////////////
+// Section 3
+/////////////// START MACROS ///////////////
+// macros
+// NO MACROS USED IN THIS CODE
+
+//////////////// END MACROS ////////////////
+
+////////////
+// Section 4
+/////////////// START MESH ///////////////
+// create mesh
+// WARNING: for physical applications, the units of the input the parameters DO matter. Make sure the unit of all input parameters are consistent. This also applies to other sections of the code, especially in sections 4 and 5.
+// create mesh and refine it uniformly
+int[int] bcids = [1,2,3,4,5,6];
+mesh3 Th = cube(ceil(length/meshsize),ceil(width/meshsize),ceil(height/meshsize),[length*x,width*y,height*z],label=bcids);
+
+// keep a copy of the global mesh
+mesh3 GlobalTh = Th;
+
+// distribute triangulation
+int[int] myN2O;
+macro ThN2O() myN2O// keep local correspondence
+buildDmesh(Th);
+
+// bounding box for global mesh
+real[int] BoundingBox(6);
+boundingbox(GlobalTh,BoundingBox);
+if (mpirank==0)
+  cout << BoundingBox << endl;
+
+// define polynomial spaces
+func Pk = P1;
+func PkxPk = [Pk, Pk];
+
+// some global FE spaces for printing data to file
+fespace GlobalHh(GlobalTh,PkxPk);
+fespace GlobalQh(GlobalTh,Pk);
+
+// local FE spaces on whole domain
+fespace Hh(Th,PkxPk);
+fespace Qh(Th,Pk);
+
+// define variables at current and previous time step
+Hh [Vnew,Uenew];
+Qh Vtilde, Vold, minfold, hinfold;
+
+// define variables for writing to and reading from file 
+GlobalHh [Loc2GlobVold,Loc2GlobUeold], [GlobalVold,GlobalUeold];
+GlobalHh [Loc2Globminf,Loc2Globhinf], [Globalminf,Globalhinf];
+GlobalQh TotalVold, Totalminf, Totalhinf;
+
+// need to keep the local to global correspondence
+int[int] loc2globidx = restrict(Hh,GlobalHh,myN2O);
+int[int] loc2globQhidx = restrict(Qh,GlobalQh,myN2O);
+
+// Get mesh size
+fespace Ph(Th, P0);
+Ph h = hTriangle;
+real hmax = h[].max;
+
+// Points where measurement is taken (MUST be as for EMI for comparison)
+real[int] pointx = [GapLength/2,GapLength/2,length-GapLength/2,length-GapLength/2];
+real[int] pointy = [GapLength/2,width-GapLength/2,GapLength/2,width-GapLength/2];
+real[int] pointz = [height/4,height/4,height/4,height/4];
+assert(pointx.n == pointy.n); // must have the same number of x and y coords
+assert(pointy.n == pointz.n); // must have the same number of y and z coords
+
+// dofs
+int Qhdofs = Qh.ndof, totaldofs = Hh.ndof;
+//////////////// END MESH ////////////////
+//////////////// START PROBLEM SETUP ////////////////
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// specify where to apply stimulus
+//func E1Domain = 1*(x<=E1xmin + E1length && x>=E1xmin && y<=E1ymin+E1width && y>=E1ymin);
+func E1Domain = 1*(x<=E1xmin + E1length && x>=E1xmin && y<=E1ymin+E1width && y>=E1ymin);
+/*
+ *  E1Boundary can make use of the bounding boxes like so:
+ *  -   x==BoundingBox[0] : apply on boundary with x xmin
+ *  -   x==BoundingBox[1] : apply on boundary with x xmax
+ *  -   y==BoundingBox[2] : apply on boundary with y ymin
+ *  -   y==BoundingBox[3] : apply on boundary with y ymax
+ *  -   x==BoundingBox[4] : apply on boundary with z zmin
+ *  -   x==BoundingBox[5] : apply on boundary with z zmax
+ */
+func E1Boundary = 1 * ((x <= E1xmin + E1length && x >= E1xmin) && // x limits
+                       (y <= E1ymin + E1width && y >= E1ymin) &&  // y limits
+                       (z == BoundingBox[5])                      // on a z boundary
+                      );
+//func E1Boundary = 1*(x<=E1xmin + E1length && x>=E1xmin && y==BoundingBox[2])/*  + 1*(y<E1ymin+E1width && y>E1ymin && x==BoundingBox[0]) */;
+Qh IDcellConstsOn = 1*E1Domain;
+
+////////////////////////////////////////////////////////////////////////////////
+// define bilinear form (assuming BE scheme for Ue and W) //////////////////
+////////////////////////////////////////////////////////////////////////////////
+varf bf([V,Ue],[VV,UUe]) = int3d(Th,optimize=2,qforder=3)((1.0/chi)*(sigmaix*(dx(V) + dx(Ue))*dx(VV) + sigmaiy*(dy(V) + dy(Ue))*dy(VV) + sigmaiz*(dz(V) + dz(Ue))*dz(VV)) + (Cm/dt)*V*VV)
+  + int3d(Th,optimize=2,qforder=3)((1.0/chi)*(sigmaix*dx(V)*dx(UUe) + sigmaiy*dy(V)*dy(UUe) + sigmaiz*dz(V)*dz(UUe) + (sigmaix+sigmaex)*dx(Ue)*dx(UUe) + (sigmaiy+sigmaey)*dy(Ue)*dy(UUe) + (sigmaiz+sigmaez)*dz(Ue)*dz(UUe)));
+
+// create matrices
+Mat LHS, LHSDirichletBC;
+macro def(u)[u, u#B]//EOM
+macro init(u)[u, u]//EOM
+createMat(Th,LHS,PkxPk);
+createMat(Th,LHSDirichletBC,PkxPk);
+LHS = bf(Hh,Hh);
+
+// set solver
+set(LHS,sparams = "-pc_type gamg -ksp_type gmres -ksp_max_it 200"); //-ksp_view 
+////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////
+// Set up RHS //////////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////////////////////////
+// create RHS and full solution vectors 
+real[int] RHS(totaldofs);
+real[int] fullsol(totaldofs);
+////////////////////////////////////////////////////////////////////////////////
+//////////////// END PROBLEM SETUP ////////////////
+
+while (S1Magnitude <= MaxS1Magnitude)
+{
+  // restart current time and S2Start
+  if (RestartComputation)
+    initialtime = restarttime;
+  else
+    initialtime = 0.0;
+    
+  currenttime = initialtime;
+  S2Start = S1S2Interval;
+
+  if (!RestartComputation)
+  {
+    if (mpirank == 0)
+    {
+      cout << "Starting computation with:" << endl;
+      cout << "\t Time = " << initialtime << " ms" << endl;
+      cout << "\t S2 = " << S2Magnitude << " mV or uA/mm^2 or uA/mm^3" << endl;
+      cout << "\t S1-S2 interval = " << S1S2Interval << " ms" << endl;
+    }
+  }
+
+  ////////////
+  // Section 5
+  /////////////// START PROBLEM SETUP ///////////////
+  // problem setup
+  ////////////////////////////////////////////////////////////////////////////////
+  // Active cell model ///////////////////////////////////////////////////////////
+  //////////////////////////////////////////////////////////////////////////////// 
+  // Set cell model and initial values
+  // CellML variable sizes not automatically determined (here)
+  int NUMRATES=3;
+  int NUMALGEBRAIC=7;
+  int NUMCONSTS=17;
+
+  int S1StartID = 13;
+  int S1PeriodID = 14;
+  int S1DurationID = 15;
+  int S1MagnitudeID = 16;
+
+  int S2StartID = 13;
+  int S2PeriodID = 14;
+  int S2DurationID = 15;
+  int S2MagnitudeID = 16;
+
+  // Space for cell variables on the intra-extra cellular membrane
+  real[int,int] cellStates(Qhdofs,NUMRATES), cellStatesOld(Qhdofs,NUMRATES), cellRates(Qhdofs,NUMRATES), cellAlgebraic(Qhdofs,NUMALGEBRAIC);
+  real[int] cellConstsOff(NUMCONSTS), cellConstsOn(NUMCONSTS); // same values over the entirety of the domain
+  // temp arrays for copying
+  real[int] tempRates(NUMRATES), tempStates(NUMRATES), tempAlgebraic(NUMALGEBRAIC), tempCellConsts(NUMCONSTS);
+
+  // set initial condition (considering checkpointed solutions)
+  if (RestartComputation)
+  {
+    {
+      ifstream PotentialFile(CheckPointedPotentialFileName);
+      PotentialFile >> TotalVold[];
+      ifstream minfFile(CheckPointedminfFileName);
+      minfFile >> Totalminf[];
+      ifstream hinfFile(CheckPointedhinfFileName);
+      hinfFile >> Totalhinf[];
+    }
+
+    cellStates(:,0) = TotalVold[](loc2globQhidx);
+    cellStates(:,1) = Totalminf[](loc2globQhidx);
+    cellStates(:,2) = Totalhinf[](loc2globQhidx);
+  }
+  // Initialize constants and initial values from the cell model in ff-cellmodel
+  for(int jj = 0;jj < Qhdofs; ++jj)
+  {
+    // set initial values for cell models constants
+    ffinitConsts(cellConstsOff, tempRates, tempStates);  
+    ffinitConsts(cellConstsOn, tempRates, tempStates);
+
+    if (RestartComputation)
+    {
+      tempStates = cellStates(jj,:);
+    }
+
+    ffcomputeRates(initialtime, cellConstsOff, tempRates, tempStates, tempAlgebraic);
+    ffcomputeVariables(initialtime, cellConstsOff, tempRates, tempStates, tempAlgebraic);
+    
+    cellRates(jj,:) = tempRates;
+    cellStates(jj,:) = tempStates;
+    cellAlgebraic(jj,:) = tempAlgebraic;
+  }
+
+  // initial value for transmembrane potential is specified by cellStates(:,0)
+  Vold[] = cellStates(:,0);
+
+  // Periodic pulse stim protocol built in to the cell model
+  // We have to modify the following lines since the numbering of 
+  // the variables in the different cell models is not consistent
+  // (from the cellML website).
+  cellConstsOff[S1StartID] = -1;
+  cellConstsOff[S1PeriodID] = -1;
+  cellConstsOff[S1DurationID] = -1;
+  cellConstsOff[S1MagnitudeID] = -1;
+
+  cellConstsOff[S2StartID] = -1;
+  cellConstsOff[S2PeriodID] = -1;
+  cellConstsOff[S2DurationID] = -1;
+  cellConstsOff[S2MagnitudeID] = -1;
+
+  ////////////
+  // Section 6
+  /////////////// START OUTFILE FILE ///////////////
+  // output file setup
+  /*
+  *
+  *  OUTPUT
+  *
+  */
+  string outFileName = getARGV("-outputfile",""+outDirName+"Nov1-3d_bidomain_output-"+ncellsx+"x"+ncellsy+"x"+ncellsz+"cells-S1Stim"+S1Magnitude+".txt");
+
+  bool outFile = true;
+
+  // print some useful information
+  if (mpirank == 0)
+  {
+    cout << "************************************************************************\n";
+    cout << "** Running simulation.                                                **\n";
+    cout << "** Forcing S1 period = " << S1Period << endl;
+    cout << "** Forcing S2 period = " << S2Period << endl;
+    cout << "** Parameters:\n";
+    cout << "**   meshsize = " << hmax << endl;
+    cout << "**   dt = " << dt << endl;
+    cout << "**   DOFS = " << totaldofs << endl;
+    cout << "**   sigmaix = " << sigmaix << endl;
+    cout << "**   sigmaiy = " << sigmaiy << endl;
+    cout << "**   sigmaiz = " << sigmaiz << endl;
+    cout << "**   sigmaex = " << sigmaex << endl;
+    cout << "**   sigmaey = " << sigmaey << endl;
+    cout << "**   sigmaez = " << sigmaez << endl;
+    cout << "**   chi   = " << chi << endl;
+    cout << "**   Cm   = " << Cm << endl;
+    if (outFile == true)
+    {
+      cout << "** Output file: " << outFileName << endl;
+    }  
+    cout << "************************************************************************\n";
+
+    // open file to overwrite it everytime we run the code
+    if (outFile == true && !RestartComputation)
+    {
+      ofstream outputFile(outFileName);
+      outputFile << "# time ";
+      for (int ipoint = 0; ipoint<pointx.n; ++ipoint) 
+      {
+        outputFile << "$v(" << pointx(ipoint) << "," << pointy(ipoint) << "," << pointz(ipoint) << ")$ ";
+      }
+      outputFile << endl;
+
+      outputFile << "xpoints ";
+      for (int ipoint = 0; ipoint<pointx.n; ++ipoint) 
+      {
+        outputFile << pointx(ipoint) << " ";
+      }
+      outputFile << endl;
+
+      outputFile << "ypoints ";
+      for (int ipoint = 0; ipoint<pointy.n; ++ipoint) 
+      {
+        outputFile << pointy(ipoint) << " ";
+      }
+      outputFile << endl;
+
+      outputFile << "zpoints ";
+      for(int ipoint = 0; ipoint<pointz.n; ++ipoint) 
+      {
+        outputFile << pointz(ipoint) << " ";
+      }
+      outputFile << endl;
+    }
+  }
+
+  //////////////// END OUTFILE FILE ////////////////
+
+  ////////////
+  // Section 7
+  /////////////// SOLVE PROBLEM ///////////////
+  // solve problem
+  ////////////////////////////////////////////////////////////////////////////////
+  // Main loop (time evolution) //////////////////////////////////////////////////
+  ////////////////////////////////////////////////////////////////////////////////
+  while (currenttime < finaltime)
+    {
+      step = step+1;
+      // if (mpirank == 0 && step%saveSteps == 0)
+      // {
+      //   cout << "Computation progress = " << currenttime/finaltime*100 << "%" << endl;
+      // }
+
+      // Plot and save solutions (only if needed)
+      if (step%saveSteps == 0)
+      {
+        Hh [LocVold,LocUold] = [Vold,Uenew];
+        real[int] tempVec;
+        changeNumbering(LHS,LocVold[],tempVec);
+        changeNumbering(LHS,LocVold[],tempVec,inverse=true);
+        Loc2GlobVold[](loc2globidx)= LocVold[];
+        mpiAllReduce(Loc2GlobVold[],GlobalVold[],mpiCommWorld,mpiSUM);
+        
+        TotalVold = GlobalVold;
+
+        // Output desired variables to file
+        if (outFile == true && mpirank == 0)
+        {
+          ofstream outputFile(outFileName,append);
+          outputFile.precision(16);
+          outputFile << currenttime << " ";
+          for(int ipoint = 0; ipoint<pointx.n; ++ipoint)
+          {
+            outputFile << TotalVold(pointx(ipoint),pointy(ipoint),pointz(ipoint)) << " "; 
+          }
+          outputFile << endl;
+        }
+
+        if (step%plotSteps == 0)
+        {
+          // plot solution (only if really needed)
+          plot(GlobalTh,TotalVold,cmm = "Intra- and extra-cellular AP at "+currenttime+" ms",fill = true,wait=false,value=true, dim = 3);
+
+          // save solution to vtu file
+          savevtk(""+outDirName+"3d_bidomain_vtuoutput_S1Stim"+S1Magnitude+"_S2Stim"+S2Magnitude+"_S1S2Interval"+S1S2Interval+"_time"+currenttime+"ms.vtu",GlobalTh,TotalVold);
+        }
+
+        if (step%checkpointingSteps == 0)
+        {
+          Hh [Locminf,Lochinf] = [minfold,hinfold];
+          real[int] tempVec;
+          changeNumbering(LHS,Locminf[],tempVec);
+          changeNumbering(LHS,Locminf[],tempVec,inverse=true);
+          Loc2Globminf[](loc2globidx)= Locminf[];
+          mpiAllReduce(Loc2Globminf[],Globalminf[],mpiCommWorld,mpiSUM);
+          
+          Totalminf = Globalminf;
+          Totalhinf = Globalhinf;
+          
+          if (mpirank == 0)
+          {
+            // save values to CheckPointDataFileName
+            ofstream DataFile(CheckPointDataFileName);
+            DataFile.precision(16);
+            DataFile << currenttime << " /* current time, corresponds to initialtime in the bash script */\n";
+            DataFile << S2Magnitude << " /* current value S2 stimulus, corresponds to MinS2Magnitude in the bash script */\n";
+            DataFile << S1S2Interval << " /* current S1-S2 interval, corresponds to MinS1S2Interval in the bash script */";
+            DataFile << endl;
+
+            // save Vold, minfold, and hinfold for re-starting simulations 
+            ofstream PotentialFile(CheckPointedPotentialFileName); 
+            PotentialFile.precision(16);
+            PotentialFile << TotalVold[];
+
+            ofstream minfFile(CheckPointedminfFileName); 
+            minfFile.precision(16);
+            minfFile << Totalminf[]; 
+            
+            ofstream hinfFile(CheckPointedhinfFileName);
+            hinfFile.precision(16);
+            hinfFile << Totalhinf[]; 
+          }
+        }
+      }
+
+      // Update dynamics on membrane interface
+      // We use FE here to perform this task
+      // We use a cell model to describe the
+      // dynamics of the potential, current density,
+      // and state variables on the membrane
+      Vtilde = Vold;
+      
+      for (int jj = 0; jj < Qhdofs; ++jj)
+      {
+        cellStates(jj,0) = Vtilde[](jj);
+
+        for(int isubstep = 0; isubstep < NodeSubsteps; ++isubstep)
+        {
+          real subTime = currenttime+isubstep*dt/NodeSubsteps;
+
+          // need to reset S1 and S2 for subTime
+          real S1Cycle = fmod(subTime,S1Period);
+          bool S1currentOn = (S1Cycle>=S1Start) && (S1Cycle<=S1Start+S1Duration);
+          real S2Cycle = fmod(subTime,S2Period);
+          bool S2currentOn = (S2Cycle>=S2Start) && (S2Cycle<=S2Start+S2Duration);
+          
+          tempRates = cellRates(jj,:);
+          tempStates = cellStates(jj,:);
+          tempAlgebraic = cellAlgebraic(jj,:);
+          
+          // Set applied current to be called within cell model
+          if (CellModelOn && S1currentOn && abs(IDcellConstsOn[](jj) - 1) < tol)
+          {
+            // cout << "Using cell model" << endl; 
+            cellConstsOn[S1StartID] = S1Start;
+            cellConstsOn[S1PeriodID] = S1Period;
+            cellConstsOn[S1DurationID] = S1Duration;
+            cellConstsOn[S1MagnitudeID] = S1Magnitude;
+            tempCellConsts = cellConstsOn(:);
+          }
+          else if (CellModelOn && S2currentOn && abs(IDcellConstsOn[](jj) - 1) < tol)
+          {
+            // S2 protocol (need to reset some cell model consts)
+            cellConstsOn[S2StartID] = S2Start;
+            cellConstsOn[S2PeriodID] = S2Period;
+            cellConstsOn[S2DurationID] = S2Duration;
+            cellConstsOn[S2MagnitudeID] = S2Magnitude; // E1
+            tempCellConsts = cellConstsOn(:);
+          }
+          else
+          {
+            // by default, cell mode is off
+            tempCellConsts = cellConstsOff(:);
+          }
+          
+          ffcomputeRates(subTime, tempCellConsts, tempRates, tempStates, tempAlgebraic);
+          cellRates(jj,:) = tempRates;
+
+          // Update all Cell variables (only NUMRATES variables to update)
+          if (RLOn)
+          {
+            // use Rush-Larsen
+            // use exponential Euler method for gating variables
+            // update m_inf
+            cellStates(jj,1) = tempAlgebraic[0]+(tempStates[1]-tempAlgebraic[0])*exp(-dt/NodeSubsteps/tempCellConsts[8]);
+            // // update h_inf
+            cellStates(jj,2) = tempAlgebraic[1]+(tempStates[2]-tempAlgebraic[1])*exp(-dt/NodeSubsteps/tempAlgebraic[2]);
+            // use FE for non-gating variables
+            cellStates(jj,0) = tempStates[0]+dt/NodeSubsteps*tempRates[0];
+          }
+          else
+          {
+            // use Forward Euler (by default)
+            cellStates(jj,:) = tempStates+dt/NodeSubsteps*tempRates;
+          }
+
+          cellAlgebraic(jj,:) = tempAlgebraic;
+        }
+
+        Vtilde[](jj) = cellStates(jj,0);
+        minfold[](jj) = cellStates(jj,1);
+        hinfold[](jj) = cellStates(jj,2);
+        // Ensure all algebraic relationships caught up to current time step
+        ffcomputeVariables(currenttime, tempCellConsts, tempRates, tempStates, tempAlgebraic);
+        cellAlgebraic(jj,:) = tempAlgebraic;
+      }
+
+      // set S1 and S2
+      real S1Cycle = fmod(currenttime,S1Period);
+      bool S1On = (S1Cycle>=S1Start) && (S1Cycle<=S1Start+S1Duration);
+      real S2Cycle = fmod(currenttime,S2Period);
+      bool S2On = (S2Cycle>=S2Start) && (S2Cycle<=S2Start+S2Duration);
+
+      // Set boundary and source values
+      if (CellModelOn)
+      {
+        // dynamics are already added within the previous for loop (with OS)
+        // Vold is replaced by Vtilde for coupling the OS method
+        varf rhs([unused],[VV,UUe]) = int3d(Th,optimize=2,qforder=3)((Cm/dt)*Vtilde*VV);
+
+        // set the rhs
+        RHS = rhs(0,Hh);
+
+        // Solve the linear system
+        fullsol = LHS^-1*RHS;
+      }
+      else if (DirichletBCOn)
+      {
+        func DirichletDataUe = (S1Magnitude*S1On + S2Magnitude*S2On)*E1Boundary;
+
+        varf bfDirichletBC([V,Ue],[VV,UUe]) = int3d(Th,optimize=2,qforder=3)((1.0/chi)*(sigmaix*(dx(V) + dx(Ue))*dx(VV) + sigmaiy*(dy(V) + dy(Ue))*dy(VV) + sigmaiz*(dz(V) + dz(Ue))*dz(VV)) + (Cm/dt)*V*VV) + int3d(Th,optimize=2,qforder=3)((1.0/chi)*(sigmaix*dx(V)*dx(UUe) + sigmaiy*dy(V)*dy(UUe) + sigmaiz*dz(V)*dz(UUe) + (sigmaix+sigmaex)*dx(Ue)*dx(UUe) + (sigmaiy+sigmaey)*dy(Ue)*dy(UUe) + (sigmaiz+sigmaez)*dz(Ue)*dz(UUe))) + on(bcids,Ue=DirichletDataUe);
+
+        varf rhs([unused],[VV,UUe]) = int3d(Th,optimize=2,qforder=3)((Cm/dt)*Vtilde*VV);
+
+        // set matrix with BCs
+        LHSDirichletBC = bfDirichletBC(Hh,Hh);
+        
+        // set the rhs
+        RHS = rhs(0,Hh);
+
+        // Solve the linear system
+        fullsol = LHSDirichletBC^-1*RHS;
+      }
+      else if (NeumannBCOn)
+      {
+        func NeumannDataUe = (S1Magnitude*S1On + S2Magnitude*S2On)*E1Boundary;
+        varf rhs([unused],[VV,UUe]) = int3d(Th,optimize=2,qforder=3)((Cm/dt)*Vtilde*VV) + int2d(Th,optimize=2,qforder=3,bcids)((1.0/chi)*NeumannDataUe*UUe);
+
+        // set the rhs
+        RHS = rhs(0,Hh);
+
+        // Solve the linear system
+        fullsol = LHS^-1*RHS;
+      }
+      else if (SourceTermOn)
+      {
+        func SourceTerm = (S1Magnitude*S1On + S2Magnitude*S2On)*E1Domain;
+
+        varf rhs([unused],[VV,UUe]) = int3d(Th,optimize=2,qforder=3)((1.0/chi)*SourceTerm*UUe + (Cm/dt)*Vtilde*VV);
+        
+        // set the rhs
+        RHS = rhs(0,Hh);
+
+        // Solve the linear system
+        fullsol = LHS^-1*RHS;
+      }
+      else
+      {
+        // no dynamics added here, test equilibrium
+        // Vold is replaced by Vtilde for coupling the OS method
+        varf rhs([unused],[VV,UUe]) = int3d(Th,optimize=2,qforder=3)((Cm/dt)*Vtilde*VV);
+
+        // set the rhs
+        RHS = rhs(0,Hh);
+
+        // Solve the linear system
+        fullsol = LHS^-1*RHS;
+      }
+
+      // getting back the unknowns U and V
+      Vnew[] = fullsol;
+      Vold = Vnew;
+
+      // Get ready for next step
+      currenttime += dt;
+    }
+  //////////////// END SOLVE PROBLEM ////////////////
+  //S1S2Interval += 0.5;
+    S1Magnitude += 1.0;
+  
+  // reset restart flag to continue simulations
+  if (RestartComputation)
+  {
+    if (mpirank == 0)
+      cout << "Resetting restart flag to continue computation..." << endl;
+    RestartComputation = 0; 
+  }
+}
+// end of code
