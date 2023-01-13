@@ -5,3 +5,6 @@ This repository contains all code used in the generation of data presented in "A
 EMI models in refractory cardiac tissue". 
 
 Dependencies include FreeFEM, PETSc, MUMPS, Apptainer ...
+
+https://sandbox.zenodo.org/badge/588656716.svg
+
