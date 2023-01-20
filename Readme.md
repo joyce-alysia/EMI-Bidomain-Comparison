@@ -3,26 +3,31 @@ This repository contains all source codes and the environment required to genera
 
 ## Contents
 Bash script for setting parameters and running simulations:
+
     run_bidomainEMI.sh
 
 FreeFEM codes:
+
     Bidomain_solver.edp
     EMI_solver.edp
 
 EMI mesh file for the mesh used in the study:
+
     3d_625cells_EMImesh.mesh
 
 Cell model files (Gray & Pathmanathan 2016 rabbit action potential model):
+
     gray_pathmanathan_2016.h
     ff-cellmodel.cpp
 
 MUMPS solver parameters file:
+
     ffmumps_fileparam.txt
 
 ## Accessing the container
 A singularity container has been built to provide all dependencies for the codes and ensure consistency across machines. The container is available on the cloud via Sylabs. A prerequisite to using the container is to install Apptainer: https://apptainer.org/docs/admin/main/installation.html .
 
-The container can be downloaded from a browser at https://cloud.sylabs.io/library/joyce-reimer/emi-bidomain-container/freefem_ubuntu_18_bc . 
+The container can be downloaded from a browser at https://cloud.sylabs.io/library/joyce-reimer/emi-bidomain-container/freefem_ubuntu_18_bc
 
 Alternatively, it can be pulled using the command line via the following commands:
 
@@ -40,7 +45,7 @@ To launch the container, run
 from a terminal, within the working directory.
 
 ## Setting parameters
-All parameters needed to carry out the experiments reported in the paper can be controlled using the bash script run_bidomainEMI.sh . 
+All parameters needed to carry out the experiments reported in the paper can be controlled using the bash script run_bidomainEMI.sh .
 
 To choose between running the bidomain or EMI model, change line 113 of the script. 
 
