@@ -25,6 +25,7 @@ A singularity container has been built to provide all dependencies for the codes
 The container can be downloaded from a browser at https://cloud.sylabs.io/library/joyce-reimer/emi-bidomain-container/freefem_ubuntu_18_bc . 
 
 Alternatively, it can be pulled using the command line via the following commands:
+
     singularity remote add --no-login Sylabs cloud.sylabs.io
     singularity remote list    # check that Sylabs is listed as an endpoint
     singularity remote use Sylabs
